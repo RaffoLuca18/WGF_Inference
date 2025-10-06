@@ -1,0 +1,1 @@
+n this project we show how we can derive score matching as an inference method from the perspective of the Wasserstein gradient flow of the KL divergence. We then extend our approach to MMD. All the implementations regards Gaussian centered models.
