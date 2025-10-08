@@ -111,6 +111,41 @@ def sigma_from_theta(theta: jnp.ndarray, d: int) -> jnp.ndarray:
 
 
 ####################################################################################################
+
+
+
+def rbf_sigma_median_heuristic(X: jnp.ndarray,
+                               subsample: int | None = 2000,
+                               seed: int = 0) -> float:
+    """
+    returns median(||x_i - x_j||_2) over i<j.
+    if subsample is not None and n>subsample, uses a uniform subsample of size `subsample`.
+    """
+
+
+    X_np = np.asarray(X)
+    n = X_np.shape[0]
+
+    if subsample is not None and n > subsample:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(n, size=subsample, replace=False)
+        X_np = X_np[idx]
+        n = X_np.shape[0]
+
+    X2 = np.sum(X_np*X_np, axis=1, keepdims=True)
+    D2 = X2 + X2.T - 2.0 * (X_np @ X_np.T)
+    D = np.sqrt(np.maximum(D2, 0.0))
+
+    iu = np.triu_indices(n, k=1)
+    vals = D[iu]
+    if vals.size == 0:
+        return 1.0  # fallback for degenerate tiny inputs
+    
+    return float(np.median(vals))
+
+
+
+####################################################################################################
 ####################################################################################################
 #                                                                                                  #
 # score matching (gaussian, known zero mean)                                                       #
@@ -126,8 +161,7 @@ def score_matching_cov_zero_mean(
     X: jnp.ndarray,
     ridge: float = 1e-8,
     lr: float = 1e-1,
-    steps: int = 2000,
-    seed: int = 0,
+    steps: int = 2000
 ) -> jnp.ndarray:
     """
     inputs
@@ -389,7 +423,7 @@ def adam_update(grad_t, m, v, t, theta, lr=1e-2, b1=0.9, b2=0.999, eps=1e-8):
 def fit_cov_by_wgrad_mmd_jax(X_np: np.ndarray,
                              kernel: str = "rbf",
                              # kernel params
-                             sigma_rbf: float = 1.0,
+                             sigma_rbf: float | str = "median",
                              degree: int = 2, c: float = 1.0,
                              # sampling
                              n_model: int = 4096,
@@ -399,25 +433,30 @@ def fit_cov_by_wgrad_mmd_jax(X_np: np.ndarray,
                              lr: float = 5e-2,
                              b1: float = 0.9, b2: float = 0.999,
                              # init
-                             init_from_sm: bool = True):
+                             init_from_noisy_inverse: bool = True,
+                             noise_scale: float = 1e-3):
     """
     inputs
     ------
-    X_np : numpy array (n,d), converted to jnp inside
+    X_np : numpy array (n,d)
+    noise_scale : std of gaussian white noise added to theta0
     returns
     -------
     Sigma_hat (np), theta_star (np), hist (list of floats)
     """
+
+
     X = jnp.asarray(X_np, dtype=jnp.float32)
     n, d = X.shape
 
-    # init theta
-    if init_from_sm:
-        S0 = score_matching_cov_zero_mean(X, ridge=1e-6)
-        # precision init: inverse
-        # (use cholesky inverse for stability)
-        Ls = jnp.linalg.cholesky(S0 + 1e-6 * jnp.eye(d))
-        # Omega0 = (Ls^{-T})(Ls^{-1})
+    key0 = random.PRNGKey(seed_samples)
+    key_noise, key_loss = random.split(key0)
+
+    # init theta (from inverse sample covariance)
+    if init_from_noisy_inverse:
+        S = (X.T @ X) / jnp.maximum(n, 1)
+        eps = 1e-6
+        Ls = jnp.linalg.cholesky(S + eps * jnp.eye(d))
         Linv = solve_triangular(Ls, jnp.eye(d), lower=True)
         Omega0 = Linv.T @ Linv
         L0 = jnp.linalg.cholesky(Omega0)
@@ -425,18 +464,34 @@ def fit_cov_by_wgrad_mmd_jax(X_np: np.ndarray,
     else:
         theta0 = L_to_theta(jnp.eye(d))
 
-    # loss selector
-    key0 = random.PRNGKey(seed_samples)
+    # add independent gaussian white noise to each entry of theta0
+    noise = noise_scale * random.normal(key_noise, shape=theta0.shape)
+    theta0 = theta0 + noise
+    theta_noise = theta0.copy()
 
+    # model sample count: match data by default
+    n_model = n
+
+    # loss selector (with median heuristic)
     if kernel == "rbf":
+        if isinstance(sigma_rbf, str) and sigma_rbf.lower() == "median":
+            sigma_used = rbf_sigma_median_heuristic(X, subsample=min(n, 2000), seed=seed_samples)
+        else:
+            sigma_used = float(sigma_rbf)
+
         def loss_fn(theta, key):
-            return loss_wgrad_mmd_rbf_theta(X, theta, d, key, n_model=n_model, sigma=sigma_rbf)
+            return loss_wgrad_mmd_rbf_theta(X, theta, d, key,
+                                            n_model=n_model, sigma=sigma_used)
+
     elif kernel == "poly":
         def loss_fn(theta, key):
-            return loss_wgrad_mmd_poly_theta(X, theta, d, key, n_model=n_model, degree=degree, c=c)
+            return loss_wgrad_mmd_poly_theta(X, theta, d, key,
+                                             n_model=n_model, degree=degree, c=c)
+
     elif kernel == "linear":
         def loss_fn(theta, key):
             return loss_wgrad_mmd_linear_theta(X, theta, d, key=None, n_model=0)
+
     else:
         raise ValueError("kernel must be in {'rbf','poly','linear'}")
 
@@ -447,17 +502,17 @@ def fit_cov_by_wgrad_mmd_jax(X_np: np.ndarray,
     v = jnp.zeros_like(theta)
     hist = []
 
-    key = key0
+    key = key_loss
     for t in range(1, iters+1):
         key, sub = random.split(key)
         val, g = val_and_grad(theta, sub)
         theta, m, v = adam_update(g, m, v, t, theta, lr=lr, b1=b1, b2=b2)
         hist.append(float(val))
 
-    # build Sigma from theta
     Sigma_hat = np.array(sigma_from_theta(theta, d))
+    Sigma_noise = np.array(sigma_from_theta(jnp.asarray(theta_noise), d))
 
-    return Sigma_hat, np.array(theta), hist
+    return Sigma_hat, np.array(theta), hist, Sigma_noise
 
 
 
