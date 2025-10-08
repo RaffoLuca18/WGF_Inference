@@ -14,41 +14,7 @@ from jax import jit, grad, value_and_grad, random
 from jax.scipy.linalg import solve_triangular
 import numpy as np
 import matplotlib.pyplot as plt
-
-
-
-####################################################################################################
-####################################################################################################
-#                                                                                                  #
-# score matching (gaussian, known zero mean)                                                       #
-#                                                                                                  #
-# assumption: data are centered; estimator = (X^T X)/n (tiny ridge optional).                      #
-#                                                                                                  #
-####################################################################################################
-####################################################################################################
-
-
-
-def score_matching_cov_zero_mean(X: jnp.ndarray, ridge: float = 1e-10) -> jnp.ndarray:
-    """
-    inputs
-    ------
-    X     : (n,d) jnp array, data (mean zero assumed / enforced)
-    ridge : small diagonal shift
-
-    output
-    ------
-    Sigma_hat : (d,d) covariance estimate
-    """
-
-
-    X = X - jnp.mean(X, axis=0)                 # enforce centering
-    n = X.shape[0]
-    Sigma = (X.T @ X) / jnp.maximum(n, 1)
-    if ridge > 0:
-        Sigma = Sigma + ridge * jnp.eye(Sigma.shape[0])
-
-    return Sigma
+import optax
 
 
 
@@ -141,6 +107,83 @@ def sigma_from_theta(theta: jnp.ndarray, d: int) -> jnp.ndarray:
     Sigma = Linv.T @ Linv
 
     return Sigma
+
+
+
+####################################################################################################
+####################################################################################################
+#                                                                                                  #
+# score matching (gaussian, known zero mean)                                                       #
+#                                                                                                  #
+# assumption: data are centered; estimator = (X^T X)/n (tiny ridge optional).                      #
+#                                                                                                  #
+####################################################################################################
+####################################################################################################
+
+
+
+def score_matching_cov_zero_mean(
+    X: jnp.ndarray,
+    ridge: float = 1e-8,
+    lr: float = 1e-1,
+    steps: int = 2000,
+    seed: int = 0,
+) -> jnp.ndarray:
+    """
+    inputs
+    ------
+    X     : (n, d) jnp array, data (assumed/enforced mean zero)
+    ridge : small diagonal shift / tikhonov
+    lr    : optax learning rate
+    steps : number of optimization steps
+    seed  : rng seed (kept for api symmetry)
+
+    output
+    ------
+    Sigma_hat : (d, d) covariance estimate via score matching
+    """
+
+    # center data
+    X = X - jnp.mean(X, axis=0)
+    n, d = X.shape
+
+    # empirical second moment (covariance, non-bias corrected)
+    S = (X.T @ X) / jnp.maximum(n, 1)
+    S = S + ridge * jnp.eye(d, dtype=X.dtype)  # stabilize
+
+    # parameter: theta encodes L (lower-triangular with exp diag); omega = L L^T
+    theta0 = jnp.zeros(theta_size(d), dtype=X.dtype)
+
+    # hyvärinen score objective for zero-mean gaussian:
+    # J(theta) = 0.5 * tr(Omega^2 S) - tr(Omega) + (ridge/2) * ||Omega||_F^2
+    def loss_fn(theta):
+        Omega = omega_from_theta(theta, d)
+        fit = 0.5 * jnp.trace(Omega @ Omega @ S) - jnp.trace(Omega)
+        reg = 0.5 * ridge * jnp.sum(Omega * Omega)
+        return fit + reg
+
+    loss_and_grad = jax.jit(jax.value_and_grad(loss_fn))
+
+    # optimizer
+    opt = optax.adam(lr)
+    opt_state = opt.init(theta0)
+
+    @jax.jit
+    def step(carry, _):
+        theta, opt_state = carry
+        loss, g = loss_and_grad(theta)
+        updates, opt_state = opt.update(g, opt_state, theta)
+        theta = optax.apply_updates(theta, updates)
+        return (theta, opt_state), loss
+
+    # run optimization
+    (theta_fin, _), _ = jax.lax.scan(step, (theta0, opt_state), None, length=steps)
+
+    # map back to covariance
+    Sigma_hat = sigma_from_theta(theta_fin, d)
+    Sigma_hat = 0.5 * (Sigma_hat + Sigma_hat.T)  # symmetrize (numerical)
+    return Sigma_hat
+
 
 
 
