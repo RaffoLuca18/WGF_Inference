@@ -367,25 +367,31 @@ def loss_wgrad_mmd_rbf_theta(X: jnp.ndarray,
     
 
     n = X.shape[0]
+    kx, kz, ky = random.split(key, 3)
 
-    # A(x) = E_Z[(Z-x)k(x,Z)], Z=data
-    K_xX = kernel_rbf(X, X, sigma)                               # (n,n)
-    # broadcast: (n,1,d) - (n,n,d) using X[None,:,:]? we want (n,n,d): (Z - x)
-    Z_minus_x = X[None, :, :] - X[:, None, :]                    # (n,n,d)
-    A = jnp.mean(Z_minus_x * K_xX[:, :, None], axis=1)           # (n,d)
+    idx_x = random.randint(kx, (n,), 0, n)
+    idx_z = random.randint(kz, (n,), 0, n)
+    x = X[idx_x]
+    Z = X[idx_z]
 
-    # B(x) = E_Y[(Y-x)k(x,Y)], Y=model
-    key_y = random.split(key, 1)[0]
-    Y = sample_model_from_theta(key_y, theta, d, n_model)        # (m,d)
-    K_xY = kernel_rbf(X, Y, sigma)                               # (n,m)
-    Y_minus_x = Y[None, :, :] - X[:, None, :]                    # (n,m,d)
-    B = jnp.mean(Y_minus_x * K_xY[:, :, None], axis=1)           # (n,d)
+    K_xZ = kernel_rbf(x, Z, sigma)
+    A = jnp.mean((Z[None, :, :] - x[:, None, :]) * K_xZ[:, :, None], axis=1)
+
+    Y = sample_model_from_theta(ky, theta, d, n_model)
+    K_xY = kernel_rbf(x, Y, sigma)
+    B = jnp.mean((Y[None, :, :] - x[:, None, :]) * K_xY[:, :, None], axis=1)
 
     diff = A - B
+    # jax.debug.print("retur = {}", (4.0 / (sigma**4)) * jnp.mean(jnp.sum(diff * diff, axis=1)))
 
-    return (4.0 / (sigma**4)) * jnp.mean(jnp.sum(diff*diff, axis=1))
+    return (4.0 / (sigma**4)) * jnp.mean(jnp.sum(diff * diff, axis=1)) # + 0 * l1_offdiag(theta_to_L(theta, d))
 
 
+
+def l1_offdiag(M: jnp.ndarray) -> jnp.ndarray:
+
+
+    return jnp.sum(jnp.abs(M)) - jnp.sum(jnp.abs(jnp.diag(M)))
 
 ####################################################################################################
 ####################################################################################################
@@ -470,7 +476,8 @@ def fit_cov_by_wgrad_mmd_jax(X_np: np.ndarray,
     theta_noise = theta0.copy()
 
     # model sample count: match data by default
-    n_model = n
+    if n_model is None:
+        n_model = n
 
     # loss selector (with median heuristic)
     if kernel == "rbf":
